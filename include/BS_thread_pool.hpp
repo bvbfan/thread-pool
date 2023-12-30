@@ -10,10 +10,13 @@
  * @brief BS::thread_pool: a fast, lightweight, and easy-to-use C++17 thread pool library. This header file contains the main thread pool class and some additional classes and definitions. No other files are needed in order to use the thread pool itself.
  */
 
+#include <cassert>            // assert
 #include <chrono>             // std::chrono
 #include <condition_variable> // std::condition_variable
 #include <cstddef>            // std::size_t
+#ifdef BS_THREAD_POOL_ENABLE_PRIORITY
 #include <cstdint>            // std::int_least16_t
+#endif
 #include <exception>          // std::current_exception
 #include <functional>         // std::function
 #include <future>             // std::future, std::future_status, std::promise
@@ -21,7 +24,9 @@
 #include <mutex>              // std::mutex, std::scoped_lock, std::unique_lock
 #include <optional>           // std::nullopt, std::optional
 #include <queue>              // std::priority_queue, std::queue
+#ifdef BS_THREAD_POOL_ENABLE_WAIT_DEADLOCK_CHECK
 #include <stdexcept>          // std::runtime_error
+#endif
 #include <thread>             // std::thread
 #include <type_traits>        // std::conditional_t, std::decay_t, std::invoke_result_t, std::is_void_v, std::remove_const_t
 #include <utility>            // std::forward, std::move
@@ -177,7 +182,7 @@ public:
     {
         if constexpr (std::is_void_v<T>)
         {
-            for (std::future<T>& future : *this)
+            for (auto& future : *this)
                 future.get();
             return;
         }
@@ -185,7 +190,7 @@ public:
         {
             std::vector<T> results;
             results.reserve(this->size());
-            for (std::future<T>& future : *this)
+            for (auto& future : *this)
                 results.push_back(future.get());
             return results;
         }
@@ -306,7 +311,7 @@ public:
      * @param num_threads The number of threads to use.
      * @param init_task An initialization function to run in each thread before it starts to execute any submitted tasks. The function must take no arguments and have no return value. It will only be executed exactly once, when the thread is first constructed.
      */
-    thread_pool(const concurrency_t num_threads, const std::function<void()>& init_task) : thread_count(determine_thread_count(num_threads)), threads(std::make_unique<std::thread[]>(determine_thread_count(num_threads)))
+    thread_pool(const concurrency_t num_threads, const std::function<void()>& init_task) : thread_count(determine_thread_count(num_threads))
     {
         create_threads(init_task);
     }
@@ -336,7 +341,7 @@ public:
      *
      * @return The native thread handles.
      */
-    [[nodiscard]] std::vector<std::thread::native_handle_type> get_native_handles() const
+    [[nodiscard]] std::vector<std::thread::native_handle_type> get_native_handles()
     {
         std::vector<std::thread::native_handle_type> native_handles(thread_count);
         for (concurrency_t i = 0; i < thread_count; ++i)
@@ -564,19 +569,18 @@ public:
      */
     void reset(const concurrency_t num_threads, const std::function<void()>& init_task)
     {
-        std::unique_lock tasks_lock(tasks_mutex);
 #ifdef BS_THREAD_POOL_ENABLE_PAUSE
+        std::unique_lock tasks_lock(tasks_mutex);
         const bool was_paused = paused;
         paused = true;
-#endif
         tasks_lock.unlock();
+#endif
         wait();
         destroy_threads();
         thread_count = determine_thread_count(num_threads);
-        threads = std::make_unique<std::thread[]>(thread_count);
         create_threads(init_task);
-        tasks_lock.lock();
 #ifdef BS_THREAD_POOL_ENABLE_PAUSE
+        tasks_lock.lock();
         paused = was_paused;
 #endif
     }
@@ -593,7 +597,7 @@ public:
     template <typename F, typename R = std::invoke_result_t<std::decay_t<F>>>
     [[nodiscard]] std::future<R> submit_task(F&& task BS_THREAD_POOL_PRIORITY_INPUT)
     {
-        const std::shared_ptr<std::promise<R>> task_promise = std::make_shared<std::promise<R>>();
+        auto task_promise = std::make_shared<std::promise<R>>();
         detach_task(
             [task = std::forward<F>(task), task_promise]
             {
@@ -750,13 +754,11 @@ public:
             throw wait_deadlock();
 #endif
         std::unique_lock tasks_lock(tasks_mutex);
-        waiting = true;
         tasks_done_cv.wait(tasks_lock,
             [this]
             {
                 return (tasks_running == 0) && BS_THREAD_POOL_PAUSED_OR_EMPTY;
             });
-        waiting = false;
     }
 
     /**
@@ -777,13 +779,11 @@ public:
             throw wait_deadlock();
 #endif
         std::unique_lock tasks_lock(tasks_mutex);
-        waiting = true;
         const bool status = tasks_done_cv.wait_for(tasks_lock, duration,
             [this]
             {
                 return (tasks_running == 0) && BS_THREAD_POOL_PAUSED_OR_EMPTY;
             });
-        waiting = false;
         return status;
     }
 
@@ -805,13 +805,11 @@ public:
             throw wait_deadlock();
 #endif
         std::unique_lock tasks_lock(tasks_mutex);
-        waiting = true;
         const bool status = tasks_done_cv.wait_until(tasks_lock, timeout_time,
             [this]
             {
                 return (tasks_running == 0) && BS_THREAD_POOL_PAUSED_OR_EMPTY;
             });
-        waiting = false;
         return status;
     }
 
@@ -841,15 +839,15 @@ private:
      */
     void create_threads(const std::function<void()>& init_task)
     {
-        {
-            const std::scoped_lock tasks_lock(tasks_mutex);
-            tasks_running = thread_count;
-            workers_running = true;
-        }
+        const std::scoped_lock tasks_lock(tasks_mutex);
+        assert(!workers_running && !tasks_running && threads.empty());
+        tasks_running = thread_count;
+        threads.reserve(thread_count);
         for (concurrency_t i = 0; i < thread_count; ++i)
         {
-            threads[i] = std::thread(&thread_pool::worker, this, i, init_task);
+            threads.emplace_back(&thread_pool::worker, this, i, init_task);
         }
+        workers_running = true;
     }
 
     /**
@@ -866,6 +864,8 @@ private:
         {
             threads[i].join();
         }
+        threads.clear();
+        thread_count = 0;
     }
 
     /**
@@ -874,13 +874,11 @@ private:
      * @param num_threads The parameter passed to the constructor or `reset()`. If the parameter is a positive number, then the pool will be created with this number of threads. If the parameter is non-positive, or a parameter was not supplied (in which case it will have the default value of 0), then the pool will be created with the total number of hardware threads available, as obtained from `std::thread::hardware_concurrency()`. If the latter returns zero for some reason, then the pool will be created with just one thread.
      * @return The number of threads to use for constructing the pool.
      */
-    [[nodiscard]] static concurrency_t determine_thread_count(const concurrency_t num_threads)
+    [[nodiscard]] static concurrency_t determine_thread_count(concurrency_t num_threads)
     {
-        if (num_threads > 0)
-            return num_threads;
-        if (std::thread::hardware_concurrency() > 0)
-            return std::thread::hardware_concurrency();
-        return 1;
+        if (num_threads <= 0)
+            num_threads = std::thread::hardware_concurrency();
+        return std::max(concurrency_t{1}, num_threads);
     }
 
     /**
@@ -894,34 +892,28 @@ private:
         this_thread::get_index.index = idx;
         this_thread::get_pool.pool = this;
         init_task();
-        std::unique_lock tasks_lock(tasks_mutex);
         while (true)
         {
-            --tasks_running;
-            tasks_lock.unlock();
-            if (waiting && (tasks_running == 0) && BS_THREAD_POOL_PAUSED_OR_EMPTY)
-                tasks_done_cv.notify_all();
-            tasks_lock.lock();
-            task_available_cv.wait(tasks_lock,
-                [this]
-                {
-                    return !BS_THREAD_POOL_PAUSED_OR_EMPTY || !workers_running;
-                });
-            if (!workers_running)
-                break;
+            std::function<void()> task;
             {
+                std::unique_lock tasks_lock(tasks_mutex);
+                if (--tasks_running == 0 && BS_THREAD_POOL_PAUSED_OR_EMPTY)
+                    tasks_done_cv.notify_all();
+                if (BS_THREAD_POOL_PAUSED_OR_EMPTY)
+                    task_available_cv.wait(tasks_lock, [this] {
+                        return !BS_THREAD_POOL_PAUSED_OR_EMPTY || !workers_running;
+                    });
+                if (!workers_running)
+                    break;
 #ifdef BS_THREAD_POOL_ENABLE_PRIORITY
-                const std::function<void()> task = std::move(std::remove_const_t<pr_task&>(tasks.top()).task);
-                tasks.pop();
+                task = std::move(std::remove_const_t<pr_task&>(tasks.top()).task);
 #else
-                const std::function<void()> task = std::move(tasks.front());
-                tasks.pop();
+                task = std::move(tasks.front());
 #endif
+                tasks.pop();
                 ++tasks_running;
-                tasks_lock.unlock();
-                task();
             }
-            tasks_lock.lock();
+            task();
         }
         this_thread::get_index.index = std::nullopt;
         this_thread::get_pool.pool = std::nullopt;
@@ -952,14 +944,13 @@ private:
             if (index_after_last > first_index)
             {
                 const size_t total_size = static_cast<size_t>(index_after_last - first_index);
-                if (num_blocks > total_size)
-                    num_blocks = total_size;
+                num_blocks = std::min(num_blocks, total_size);
                 block_size = total_size / num_blocks;
                 remainder = total_size % num_blocks;
                 if (block_size == 0)
                 {
                     block_size = 1;
-                    num_blocks = (total_size > 1) ? total_size : 1;
+                    num_blocks = std::max(total_size, size_t{1});
                 }
             }
             else
@@ -987,7 +978,7 @@ private:
          */
         [[nodiscard]] T end(const size_t block) const
         {
-            return (block == num_blocks - 1) ? index_after_last : start(block + 1);
+            return (block >= num_blocks - 1) ? index_after_last : start(block + 1);
         }
 
         /**
@@ -1125,12 +1116,7 @@ private:
     /**
      * @brief A smart pointer to manage the memory allocated for the threads.
      */
-    std::unique_ptr<std::thread[]> threads = nullptr;
-
-    /**
-     * @brief A flag indicating that `wait()` is active and expects to be notified whenever a task is done.
-     */
-    bool waiting = false;
+    std::vector<std::thread> threads;
 
     /**
      * @brief A flag indicating to the workers to keep running. When set to `false`, the workers terminate permanently.
